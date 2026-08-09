@@ -1,0 +1,15 @@
+{
+  "AutoStopSeed": {
+    "name": "自动停止做种",
+    "description": "MoviePilot 创建的下载任务整理完成后，自动停止对应种子的做种（暂停上传，不删文件）。",
+    "labels": "下载管理",
+    "version": "1.0.0",
+    "icon": "pause.png",
+    "author": "AutoStopSeed",
+    "level": 1,
+    "system_version": ">=2.12.0",
+    "history": {
+      "v1.0.0": "初始版本：整理完成后自动停止 MoviePilot 创建种子的做种。"
+    }
+  }
+}
