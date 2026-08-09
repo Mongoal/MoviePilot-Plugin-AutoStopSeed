@@ -10,6 +10,7 @@ class EventType(Enum):
     """事件类型枚举 stub。"""
 
     TransferComplete = "transfer.complete"
+    DownloadAdded = "download.added"
 
 
 class NotificationType(Enum):

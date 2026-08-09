@@ -1,15 +1,19 @@
-"""AutoStopSeed 插件：MoviePilot 创建的下载任务整理完成后自动停止做种。
+"""AutoStopSeed 插件：自动停止做种，支持两种互斥模式。
 
-设计依据（MoviePilot v2 源码）：
-- MoviePilot 创建的每个种子都会被打上内置标签 TORRENT_TAG（默认 ``MOVIEPILOT``），
-  见 ``app/modules/qbittorrent/__init__.py`` 添加下载处；qb 自身手动创建的种子不带该标签。
-- 整理与下载是两个独立环节：整理可能由无下载来源的文件触发，也可能在下载未完成时
-  被手动触发（多集种子先下完部分集）。MoviePilot 自身在打「已整理」标签前用
-  ``__is_torrent_download_completed``（``app/chain/transfer.py``）检查种子整体下载完成，
-  注释直接指出未整体完成就打标签会卡死剩余内容下载（issue #6009）。
-- 本插件复用同一判定：停止做种前用一次 ``list_torrents(hashs=[hash])``（默认按
-  TORRENT_TAG 过滤）同时校验「种子由 MP 创建」与「progress >= 100 整体下载完成」，
-  任一不满足即跳过，绝不卡死未完成的下载任务。
+模式 B（默认，下载触发）：监听 ``EventType.DownloadAdded``，下载添加时即给种子设置
+做种时间限制 ``seeding_time_limit``（单位分钟）。做种计时与停止完全由下载器自身完成——
+qb / Transmission 下载完成后做种满设定分钟数自动停止，无需轮询、不依赖整理环节。
+- 底层能力见 ``app/modules/qbittorrent/qbittorrent.py change_torrent`` 与
+  ``app/chain/__init__.py update_torrent``，参数 ``seeding_time_limit`` 单位为分钟。
+- 注意 rTorrent 封装不支持做种时间限制（``app/modules/rtorrent/__init__.py`` 直接返回 False），
+  使用 rTorrent 时本模式无效，应改用模式 A。
+
+模式 A（可代替，整理触发）：监听 ``EventType.TransferComplete``，文件整理完成时停止做种。
+- MoviePilot 没有「下载完成」事件，整理完成是唯一隐含"下载已完成"语义的事件；
+- 整理与下载独立，整理可能在下载未完成时被手动触发，故模式 A 停止前用一次
+  ``list_torrents(hashs=[hash])``（默认按 TORRENT_TAG 过滤）同时校验「种子由 MP 创建」
+  与「progress >= 100 整体下载完成」，任一不满足即跳过，绝不卡死未完成的下载任务
+  （对应 MoviePilot issue #6009 同类问题）。
 """
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -18,15 +22,23 @@ from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas.types import EventType, NotificationType
 
+# 模式 B：下载添加时设置做种时间限制
+MODE_ON_DOWNLOAD = "on_download"
+# 模式 A：整理完成时停止做种
+MODE_ON_TRANSFER = "on_transfer"
+
 
 class AutoStopSeed(_PluginBase):
-    """整理完成后自动停止做种（暂停上传，不删文件）。"""
+    """自动停止做种（默认下载添加时设做种限制，可选整理完成时停）。"""
 
     # ===== 插件元信息（与 package.v2.json 保持一致）=====
     plugin_name = "自动停止做种"
-    plugin_desc = "MoviePilot 创建的下载任务整理完成后，自动停止对应种子的做种（暂停上传，不删文件）。"
+    plugin_desc = (
+        "下载添加时设置做种时间限制（默认，做种满 N 分钟自动停），"
+        "或整理完成时停止做种。仅作用于 MoviePilot 创建的种子。"
+    )
     plugin_icon = "pause.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     plugin_author = "AutoStopSeed"
     plugin_label = "下载管理"
     plugin_config_prefix = "autostopseed_"
@@ -35,16 +47,27 @@ class AutoStopSeed(_PluginBase):
 
     # ===== 运行时状态 =====
     _enabled: bool = False
+    _mode: str = MODE_ON_DOWNLOAD
+    _seeding_time: int = 1
     _notify: bool = True
 
     def init_plugin(self, config: dict = None) -> None:
         """根据插件配置初始化运行状态。"""
         # 先复位为默认值，保证多次初始化幂等
         self._enabled = False
+        self._mode = MODE_ON_DOWNLOAD
+        self._seeding_time = 1
         self._notify = True
         if not config:
             return
         self._enabled = bool(config.get("enabled"))
+        mode = config.get("mode") or MODE_ON_DOWNLOAD
+        # 非法值回退到默认模式
+        self._mode = mode if mode in (MODE_ON_DOWNLOAD, MODE_ON_TRANSFER) else MODE_ON_DOWNLOAD
+        try:
+            self._seeding_time = max(0, int(config.get("seeding_time", 1)))
+        except (TypeError, ValueError):
+            self._seeding_time = 1
         self._notify = bool(config.get("notify", True))
 
     def get_state(self) -> bool:
@@ -92,10 +115,57 @@ class AutoStopSeed(_PluginBase):
                                 "props": {"cols": 12},
                                 "content": [
                                     {
+                                        "component": "VSelect",
+                                        "props": {
+                                            "model": "mode",
+                                            "label": "停止做种时机",
+                                            "items": [
+                                                {
+                                                    "title": "下载添加时设做种限制（做种满 N 分钟自动停，不依赖整理）",
+                                                    "value": MODE_ON_DOWNLOAD,
+                                                },
+                                                {
+                                                    "title": "整理完成时停止做种（需开启自动整理）",
+                                                    "value": MODE_ON_TRANSFER,
+                                                },
+                                            ],
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12, "md": 6},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "seeding_time",
+                                            "label": "做种时长（分钟，仅「下载添加时」模式生效）",
+                                            "placeholder": "下载完成后做种满该分钟数自动停止，0 表示下载完即停",
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
                                         "component": "VSwitch",
                                         "props": {
                                             "model": "notify",
-                                            "label": "停止做种后发送消息通知",
+                                            "label": "操作后发送消息通知",
                                         },
                                     }
                                 ],
@@ -115,8 +185,9 @@ class AutoStopSeed(_PluginBase):
                                             "type": "info",
                                             "variant": "tonal",
                                             "text": (
-                                                "仅停止 MoviePilot 自己创建的种子（带内置标签）。"
-                                                "文件不会被删除，可在下载器中手动恢复做种。"
+                                                "仅作用于 MoviePilot 创建的种子。「下载添加时」模式由下载器"
+                                                "（qBittorrent / Transmission）自动计时停止；rTorrent 不支持做种时间限制，"
+                                                "请改用「整理完成时」模式。文件不会被删除，可在下载器手动恢复。"
                                             ),
                                         },
                                     }
@@ -128,6 +199,8 @@ class AutoStopSeed(_PluginBase):
             }
         ], {
             "enabled": False,
+            "mode": MODE_ON_DOWNLOAD,
+            "seeding_time": 1,
             "notify": True,
         }
 
@@ -135,13 +208,14 @@ class AutoStopSeed(_PluginBase):
         """返回插件详情页。"""
         if not self._enabled:
             return None
+        mode_text = "下载添加时设做种限制" if self._mode == MODE_ON_DOWNLOAD else "整理完成时停止做种"
         return [
             {
                 "component": "VAlert",
                 "props": {
                     "type": "success",
                     "variant": "tonal",
-                    "text": "自动停止做种已启用：整理完成后将停止对应 MoviePilot 种子的做种。",
+                    "text": f"自动停止做种已启用，当前模式：{mode_text}",
                 },
             }
         ]
@@ -150,20 +224,82 @@ class AutoStopSeed(_PluginBase):
         """停止插件后台服务。本插件无后台服务，空实现即可。"""
         return None
 
-    # ===== 核心：监听整理完成事件 =====
+    # ===== 模式 B：下载添加时设置做种时间限制 =====
+    @eventmanager.register(EventType.DownloadAdded)
+    def on_download_added(self, event: Event):
+        """下载添加时，给种子设置做种时间限制，由下载器自动计时停止。
+
+        :param event: 下载添加事件，事件数据含 ``hash`` 与 ``downloader``。
+        """
+        if not self._enabled or self._mode != MODE_ON_DOWNLOAD:
+            return
+
+        data = event.event_data or {}
+        torrent_hash = data.get("hash")
+        downloader = data.get("downloader")
+
+        # 缺少种子哈希则无法设置
+        if not torrent_hash:
+            return
+
+        try:
+            result = self.chain.update_torrent(
+                hash_string=torrent_hash,
+                downloader=downloader,
+                seeding_time_limit=self._seeding_time,
+            )
+        except Exception as e:
+            logger.error(
+                f"设置做种时间限制异常: hash={torrent_hash}, error={e}"
+            )
+            return
+
+        # update_torrent 返回各项修改结果字典；seeding_time_limit 不被支持时该键为 False
+        if self._is_seeding_limit_set(result):
+            logger.info(
+                f"已设置做种 {self._seeding_time} 分钟后停止: "
+                f"hash={torrent_hash}, downloader={downloader}"
+            )
+            if self._notify:
+                self._send_notice(
+                    "已设置做种限制",
+                    f"做种 {self._seeding_time} 分钟后自动停止\n"
+                    f"哈希：{torrent_hash}\n下载器：{downloader or '默认'}",
+                )
+        else:
+            logger.warning(
+                f"设置做种时间限制失败（下载器可能不支持，如 rTorrent）: "
+                f"hash={torrent_hash}, result={result}"
+            )
+
+    @staticmethod
+    def _is_seeding_limit_set(result: Any) -> bool:
+        """判断 update_torrent 的返回是否成功设置了做种时间限制。
+
+        qBittorrent / Transmission 返回形如 ``{"seeding_limits": True, ...}`` 的字典；
+        rTorrent 对不支持项返回 ``{"seeding_limits": False}``；异常或 None 视为失败。
+
+        :param result: update_torrent 返回值
+        :return: True 表示设置成功
+        """
+        if not isinstance(result, dict):
+            return False
+        # 链方法对各下载器的结果键名一致为 seeding_limits（见各模块 update_torrent）
+        return bool(result.get("seeding_limits"))
+
+    # ===== 模式 A：整理完成时停止做种 =====
     @eventmanager.register(EventType.TransferComplete)
     def on_transfer_complete(self, event: Event):
-        """整理完成后，自动停止对应下载任务的做种。
+        """整理完成后，自动停止对应下载任务的做种（仅模式 A 生效）。
 
-        注意：整理与下载是两个独立环节——
-        - 整理可能由无下载来源的文件触发（拷贝/刮削入库）；
-        - 下载未完成时也可能被手动触发整理（多集种子先下完部分集）。
-        因此本方法在停止做种前必须复核两件事：种子由 MoviePilot 创建、且已整体下载完成。
-        对只下载了一部分就整理的种子，跳过停做种，避免卡死剩余内容的下载。
+        整理与下载是两个独立环节：整理可能由无下载来源的文件触发，也可能在下载未完成时
+        被手动触发（多集种子先下完部分集）。因此本方法在停止做种前必须复核两件事：
+        种子由 MoviePilot 创建、且已整体下载完成。对只下载了一部分就整理的种子，
+        跳过停做种，避免卡死剩余内容的下载。
 
         :param event: 整理完成事件，事件数据含 ``download_hash`` 与 ``downloader``。
         """
-        if not self._enabled:
+        if not self._enabled or self._mode != MODE_ON_TRANSFER:
             return
 
         data = event.event_data or {}
@@ -193,7 +329,10 @@ class AutoStopSeed(_PluginBase):
                 f"已停止做种: hash={download_hash}, downloader={downloader}"
             )
             if self._notify:
-                self._send_stop_notice(download_hash, downloader)
+                self._send_notice(
+                    "已停止做种",
+                    f"哈希：{download_hash}\n下载器：{downloader or '默认'}",
+                )
         else:
             logger.warning(
                 f"停止做种失败: hash={download_hash}, downloader={downloader}"
@@ -202,7 +341,7 @@ class AutoStopSeed(_PluginBase):
     def _should_stop_seeding(
             self, download_hash: str, downloader: Optional[str]
     ) -> Tuple[bool, str]:
-        """判断是否应对该种子停止做种，返回 (是否停止, 原因说明)。
+        """判断是否应对该种子停止做种（模式 A 复核），返回 (是否停止, 原因说明)。
 
         同时校验两项（一次 ``list_torrents`` 完成，该接口默认按内置标签
         ``TORRENT_TAG`` 过滤，故查不到即非 MoviePilot 创建）：
@@ -238,14 +377,17 @@ class AutoStopSeed(_PluginBase):
 
         return True, "MP 创建且下载完成"
 
-    def _send_stop_notice(self, download_hash: str, downloader: Optional[str]) -> None:
-        """发送停止做种的消息通知。"""
+    def _send_notice(self, title: str, text: str) -> None:
+        """发送消息通知。
+
+        :param title: 通知标题
+        :param text: 通知正文
+        """
         try:
-            # post_message 内部会构造 Notification 并补全链接，这里直接传字段即可
             self.post_message(
                 mtype=NotificationType.Organize,
-                title="自动停止做种",
-                text=f"已停止做种：{download_hash}\n下载器：{downloader or '默认'}",
+                title=title,
+                text=text,
             )
         except Exception as e:
-            logger.warning(f"发送停止做种通知失败: {e}")
+            logger.warning(f"发送通知失败: {e}")
