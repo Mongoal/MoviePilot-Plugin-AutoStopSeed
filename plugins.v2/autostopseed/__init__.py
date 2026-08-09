@@ -37,7 +37,7 @@ class AutoStopSeed(_PluginBase):
         "下载添加时设置做种时间限制（默认，做种满 N 分钟自动停），"
         "或整理完成时停止做种。仅作用于 MoviePilot 创建的种子。"
     )
-    plugin_icon = "pause.png"
+    plugin_icon = "pause.svg"
     plugin_version = "1.1.0"
     plugin_author = "AutoStopSeed"
     plugin_label = "下载管理"
