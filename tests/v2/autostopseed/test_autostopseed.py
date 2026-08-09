@@ -17,6 +17,7 @@
 被测实例构造：用 ``object.__new__`` 绕过 ``_PluginBase.__init__``（避免拉起重量级依赖），
 再手动注入 mock 的 ``chain``、``eventmanager``。这与官方插件仓单测的「只测纯逻辑」原则一致。
 """
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -54,6 +55,15 @@ def _make_event(download_hash=None, downloader=None) -> Event:
     if downloader is not None:
         data["downloader"] = downloader
     return Event(event_type="transfer.complete", event_data=data)
+
+
+def _torrent(progress: float = 100.0, **extra) -> SimpleNamespace:
+    """构造一个带 progress 属性的种子对象（模拟 DownloaderTorrent）。
+
+    真实 DownloaderTorrent 是 pydantic 模型，``progress`` 为 0-100 的百分比。
+    插件用 ``getattr(t, "progress", 0)`` 读取，故 SimpleNamespace 即可。
+    """
+    return SimpleNamespace(progress=progress, **extra)
 
 
 # ---------- init_plugin / get_state ----------
@@ -177,9 +187,9 @@ def test_transfer_non_moviepilot_torrent_skipped():
 
 
 def test_transfer_moviepilot_torrent_stops_seeding():
-    """MP 创建的种子（复核非空）应调用 stop_torrents(hash, downloader)。"""
+    """MP 创建且下载完成（progress=100）的种子应调用 stop_torrents(hash, downloader)。"""
     plugin = _make_plugin(enabled=True, notify=False)
-    plugin.chain.list_torrents.return_value = [{"hash": "abc"}]  # 能查到 → MP 种子
+    plugin.chain.list_torrents.return_value = [_torrent(100)]  # MP 种子 + 已完成
     plugin.chain.stop_torrents.return_value = True
 
     plugin.on_transfer_complete(
@@ -194,7 +204,7 @@ def test_transfer_moviepilot_torrent_stops_seeding():
 def test_transfer_notify_sent_when_enabled():
     """notify=True 且停种成功时应发送消息通知。"""
     plugin = _make_plugin(enabled=True, notify=True)
-    plugin.chain.list_torrents.return_value = [{"hash": "abc"}]
+    plugin.chain.list_torrents.return_value = [_torrent(100)]
     plugin.chain.stop_torrents.return_value = True
 
     plugin.on_transfer_complete(
@@ -211,7 +221,7 @@ def test_transfer_notify_sent_when_enabled():
 def test_transfer_no_notify_when_disabled():
     """notify=False 时即使停种成功也不发通知。"""
     plugin = _make_plugin(enabled=True, notify=False)
-    plugin.chain.list_torrents.return_value = [{"hash": "abc"}]
+    plugin.chain.list_torrents.return_value = [_torrent(100)]
     plugin.chain.stop_torrents.return_value = True
 
     plugin.on_transfer_complete(
@@ -225,7 +235,7 @@ def test_transfer_no_notify_when_disabled():
 def test_transfer_no_notify_when_stop_fails():
     """停种失败（返回 False）时不应发通知。"""
     plugin = _make_plugin(enabled=True, notify=True)
-    plugin.chain.list_torrents.return_value = [{"hash": "abc"}]
+    plugin.chain.list_torrents.return_value = [_torrent(100)]
     plugin.chain.stop_torrents.return_value = False
 
     plugin.on_transfer_complete(
@@ -239,7 +249,7 @@ def test_transfer_no_notify_when_stop_fails():
 def test_transfer_stop_torrents_exception_swallowed():
     """stop_torrents 抛异常时不应崩溃、不应发通知。"""
     plugin = _make_plugin(enabled=True, notify=True)
-    plugin.chain.list_torrents.return_value = [{"hash": "abc"}]
+    plugin.chain.list_torrents.return_value = [_torrent(100)]
     plugin.chain.stop_torrents.side_effect = RuntimeError("下载器离线")
 
     # 不应抛出
@@ -273,7 +283,7 @@ def test_transfer_list_torrents_exception_treats_as_moviepilot():
 def test_transfer_list_torrents_uses_hash_as_list_and_downloader():
     """复核时应以 [hash] 形式查询并带上 downloader。"""
     plugin = _make_plugin(enabled=True, notify=False)
-    plugin.chain.list_torrents.return_value = [{"hash": "abc"}]
+    plugin.chain.list_torrents.return_value = [_torrent(100)]
     plugin.chain.stop_torrents.return_value = True
 
     plugin.on_transfer_complete(
@@ -288,7 +298,7 @@ def test_transfer_list_torrents_uses_hash_as_list_and_downloader():
 def test_transfer_default_downloader_passed_through():
     """downloader 为 None 时也应正常传给 stop_torrents。"""
     plugin = _make_plugin(enabled=True, notify=False)
-    plugin.chain.list_torrents.return_value = [{"hash": "abc"}]
+    plugin.chain.list_torrents.return_value = [_torrent(100)]
     plugin.chain.stop_torrents.return_value = True
 
     plugin.on_transfer_complete(_make_event(download_hash="abc", downloader=None))
@@ -296,6 +306,98 @@ def test_transfer_default_downloader_passed_through():
     plugin.chain.stop_torrents.assert_called_once_with(
         hashs="abc", downloader=None
     )
+
+
+# ---------- 下载未完成不应停种（核心安全分支） ----------
+
+def test_transfer_incomplete_download_skipped():
+    """下载未完成（progress<100）即使手动触发整理，也不应停做种，避免卡死剩余下载。
+
+    场景：10 集种子里只下完 3 集就被手动整理 → 不能停做种，否则剩下 7 集永远下不完。
+    """
+    plugin = _make_plugin(enabled=True, notify=True)
+    plugin.chain.list_torrents.return_value = [_torrent(30.0)]  # MP 种子但只下 30%
+    plugin.chain.stop_torrents.return_value = True
+
+    plugin.on_transfer_complete(
+        _make_event(download_hash="abc", downloader="qBittorrent")
+    )
+
+    plugin.chain.stop_torrents.assert_not_called()
+    plugin.chain.post_message.assert_not_called()
+
+
+def test_transfer_partially_completed_torrents_skipped():
+    """多个文件任务中只要有任一未达 100%，整粒种子视为未完成，不应停做种。
+
+    对应 ``all(progress >= 100 for t in torrents)`` 的 all() 语义：
+    多文件种子任意文件未下完即整体未完成。
+    """
+    plugin = _make_plugin(enabled=True, notify=True)
+    plugin.chain.list_torrents.return_value = [
+        _torrent(100),   # 文件1 已完成
+        _torrent(60),    # 文件2 未完成
+    ]
+    plugin.chain.stop_torrents.return_value = True
+
+    plugin.on_transfer_complete(
+        _make_event(download_hash="abc", downloader="qBittorrent")
+    )
+
+    plugin.chain.stop_torrents.assert_not_called()
+
+
+def test_transfer_progress_zero_torrent_skipped():
+    """progress 为 0（刚开始下载即手动整理）不应停做种。"""
+    plugin = _make_plugin(enabled=True, notify=False)
+    plugin.chain.list_torrents.return_value = [_torrent(0)]
+    plugin.chain.stop_torrents.return_value = True
+
+    plugin.on_transfer_complete(
+        _make_event(download_hash="abc", downloader="qBittorrent")
+    )
+
+    plugin.chain.stop_torrents.assert_not_called()
+
+
+def test_transfer_progress_just_below_100_skipped():
+    """progress=99.9（接近但未达 100）应视为未完成，跳过停种。"""
+    plugin = _make_plugin(enabled=True, notify=False)
+    plugin.chain.list_torrents.return_value = [_torrent(99.9)]
+    plugin.chain.stop_torrents.return_value = True
+
+    plugin.on_transfer_complete(
+        _make_event(download_hash="abc", downloader="qBittorrent")
+    )
+
+    plugin.chain.stop_torrents.assert_not_called()
+
+
+def test_transfer_progress_exactly_100_stops():
+    """progress 恰好 100 视为完成，正常停做种（边界值）。"""
+    plugin = _make_plugin(enabled=True, notify=False)
+    plugin.chain.list_torrents.return_value = [_torrent(100)]
+    plugin.chain.stop_torrents.return_value = True
+
+    plugin.on_transfer_complete(
+        _make_event(download_hash="abc", downloader="qBittorrent")
+    )
+
+    plugin.chain.stop_torrents.assert_called_once()
+
+
+def test_transfer_progress_missing_treated_as_incomplete():
+    """种子对象无 progress 字段时按 0 处理，视为未完成，跳过停种。"""
+    plugin = _make_plugin(enabled=True, notify=False)
+    # 用 dict（无 progress 属性）模拟异常数据，getattr 返回 0
+    plugin.chain.list_torrents.return_value = [{"hash": "abc"}]
+    plugin.chain.stop_torrents.return_value = True
+
+    plugin.on_transfer_complete(
+        _make_event(download_hash="abc", downloader="qBittorrent")
+    )
+
+    plugin.chain.stop_torrents.assert_not_called()
 
 
 # ---------- stop_service ----------

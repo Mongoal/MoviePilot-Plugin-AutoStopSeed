@@ -3,11 +3,13 @@
 设计依据（MoviePilot v2 源码）：
 - MoviePilot 创建的每个种子都会被打上内置标签 TORRENT_TAG（默认 ``MOVIEPILOT``），
   见 ``app/modules/qbittorrent/__init__.py`` 添加下载处；qb 自身手动创建的种子不带该标签。
-- 整理扫描（``list_torrents``）默认按 TORRENT_TAG 过滤，非 MP 创建的种子不会进入整理流程，
-  因此能触发 ``TransferComplete`` 的种子几乎都是 MP 创建的。
-- 为严格保证「只管理 MP 自己创建的种子」，本插件在停止前再以
-  ``list_torrents(hashs=[download_hash])`` 复核一次：该接口默认带 TORRENT_TAG 过滤，
-  返回为空即说明该种子并非 MP 创建（例如下载器目录混入的外部种子被手动整理），直接跳过。
+- 整理与下载是两个独立环节：整理可能由无下载来源的文件触发，也可能在下载未完成时
+  被手动触发（多集种子先下完部分集）。MoviePilot 自身在打「已整理」标签前用
+  ``__is_torrent_download_completed``（``app/chain/transfer.py``）检查种子整体下载完成，
+  注释直接指出未整体完成就打标签会卡死剩余内容下载（issue #6009）。
+- 本插件复用同一判定：停止做种前用一次 ``list_torrents(hashs=[hash])``（默认按
+  TORRENT_TAG 过滤）同时校验「种子由 MP 创建」与「progress >= 100 整体下载完成」，
+  任一不满足即跳过，绝不卡死未完成的下载任务。
 """
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -153,6 +155,12 @@ class AutoStopSeed(_PluginBase):
     def on_transfer_complete(self, event: Event):
         """整理完成后，自动停止对应下载任务的做种。
 
+        注意：整理与下载是两个独立环节——
+        - 整理可能由无下载来源的文件触发（拷贝/刮削入库）；
+        - 下载未完成时也可能被手动触发整理（多集种子先下完部分集）。
+        因此本方法在停止做种前必须复核两件事：种子由 MoviePilot 创建、且已整体下载完成。
+        对只下载了一部分就整理的种子，跳过停做种，避免卡死剩余内容的下载。
+
         :param event: 整理完成事件，事件数据含 ``download_hash`` 与 ``downloader``。
         """
         if not self._enabled:
@@ -162,16 +170,15 @@ class AutoStopSeed(_PluginBase):
         download_hash = data.get("download_hash")
         downloader = data.get("downloader")
 
-        # 无下载来源（纯手动整理、刮削入库等）直接跳过
+        # 无下载来源（纯手动整理、刮削入库等，无对应下载任务）直接跳过
         if not download_hash:
             return
 
-        # 严格复核：只处理 MoviePilot 自己创建的种子。
-        # list_torrents 默认按 TORRENT_TAG 过滤，非 MP 创建的种子查不到即返回空。
-        if not self._is_moviepilot_torrent(download_hash, downloader):
-            logger.info(
-                f"种子 {download_hash} 非 MoviePilot 创建，跳过停止做种"
-            )
+        # 复核：仅处理「MoviePilot 创建」且「整体下载完成」的种子。
+        # 一次 list_torrents 调用同时验证两项，避免重复请求下载器。
+        should_stop, reason = self._should_stop_seeding(download_hash, downloader)
+        if not should_stop:
+            logger.info(f"跳过停止做种: hash={download_hash}, 原因={reason}")
             return
 
         # 停止做种（暂停上传，不删文件）
@@ -192,27 +199,44 @@ class AutoStopSeed(_PluginBase):
                 f"停止做种失败: hash={download_hash}, downloader={downloader}"
             )
 
-    def _is_moviepilot_torrent(self, download_hash: str, downloader: Optional[str]) -> bool:
-        """判断指定种子是否为 MoviePilot 创建。
+    def _should_stop_seeding(
+            self, download_hash: str, downloader: Optional[str]
+    ) -> Tuple[bool, str]:
+        """判断是否应对该种子停止做种，返回 (是否停止, 原因说明)。
 
-        借助 ``list_torrents(hashs=...)`` 默认按 TORRENT_TAG 过滤的特性：
-        能查到即说明该种子带内置标签（由 MP 创建）；查不到则非 MP 创建。
+        同时校验两项（一次 ``list_torrents`` 完成，该接口默认按内置标签
+        ``TORRENT_TAG`` 过滤，故查不到即非 MoviePilot 创建）：
+        1. 种子由 MoviePilot 创建（带内置标签），排除 qb/transmission 手动添加的种子；
+        2. 种子已整体下载完成（``progress >= 100``），避免对只下完一部分就手动整理
+           的种子停做种、卡死剩余内容（对应 MoviePilot issue #6009 同类问题）。
+
+        查询异常时保守放行（整理完成事件来源已大概率是 MP 种子）。
 
         :param download_hash: 种子哈希
         :param downloader: 下载器名称
-        :return: True 表示为 MoviePilot 创建的种子
+        :return: (是否应停止做种, 原因)
         """
         try:
             torrents = self.chain.list_torrents(
                 hashs=[download_hash], downloader=downloader
             )
         except Exception as e:
-            # 查询失败时保守起见放行（与整理完成事件来源一致，已大概率是 MP 种子）
+            # 查询失败时保守放行（与整理完成事件来源一致，已大概率是 MP 种子）
             logger.warning(
-                f"查询种子标签失败，按放行处理: hash={download_hash}, error={e}"
+                f"查询种子状态失败，按放行处理: hash={download_hash}, error={e}"
             )
-            return True
-        return bool(torrents)
+            return True, "查询异常放行"
+
+        # 非内置标签种子（qb 手动添加等）查不到 → 跳过
+        if not torrents:
+            return False, "非 MoviePilot 创建"
+
+        # 部分下载就手动整理的情况：progress < 100 → 跳过，避免卡死下载
+        # 复用 MoviePilot 自身判断（app/chain/transfer.py __is_torrent_download_completed）
+        if not all((getattr(t, "progress", 0) or 0) >= 100 for t in torrents):
+            return False, "下载未完成"
+
+        return True, "MP 创建且下载完成"
 
     def _send_stop_notice(self, download_hash: str, downloader: Optional[str]) -> None:
         """发送停止做种的消息通知。"""

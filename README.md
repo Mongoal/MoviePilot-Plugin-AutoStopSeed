@@ -15,8 +15,14 @@ MoviePilot **V2 插件**：MoviePilot 创建的下载任务**整理完成后，�
 1. **监听事件**：插件订阅系统事件 `EventType.TransferComplete`（文件整理完成时由 `app/chain/transfer.py` 发出），事件数据携带 `download_hash` 与 `downloader`。
 2. **只管 MoviePilot 自己创建的种子**：
    - MoviePilot 创建的每个种子都会被打上内置标签 `TORRENT_TAG`（默认 `MOVIEPILOT`）。
-   - 插件在停止前用 `list_torrents(hashs=[hash])` 复核：该接口默认按内置标签过滤，**查不到的种子（如 qb 手动添加、外部导入）直接跳过**，绝不会误停。
-3. **停止做种**：调用链方法 `self.chain.stop_torrents(hash, downloader)`（qBittorrent / Transmission / rTorrent 均已实现），效果是暂停上传、文件不删。
+   - 插件用 `list_torrents(hashs=[hash])` 复核：该接口默认按内置标签过滤，**查不到的种子（如 qb 手动添加、外部导入）直接跳过**，绝不会误停。
+3. **只对整体下载完成的种子停做种（关键）**：
+   - 整理与下载是两个独立环节——整理可能由无下载来源的文件触发，也可能在**下载未完成时被手动触发**（如 10 集种子先下完 3 集就整理）。
+   - 插件复用 MoviePilot 自身的判断（`app/chain/transfer.py __is_torrent_download_completed`）：种子 `progress >= 100` 才停做种。
+   - 对只下了一部分就整理的种子**跳过停做种**，避免卡死剩余内容的下载（对应 MoviePilot issue #6009 同类问题）。
+4. **停止做种**：调用链方法 `self.chain.stop_torrents(hash, downloader)`（qBittorrent / Transmission / rTorrent 均已实现），效果是暂停上传、文件不删。
+
+> 上述 2、3 两项校验合并为一次 `list_torrents` 调用，避免重复请求下载器。
 
 > 与「下载器自带做种时间/分享率限制」的区别：本插件是「整理完成立即停」，更精确；下载器限制是「按时间/比率停」。
 
@@ -45,6 +51,9 @@ MoviePilot **V2 插件**：MoviePilot 创建的下载任务**整理完成后，�
 
 **Q：手动整理一个外部种子时会触发吗？**
 通常不会。MoviePilot 的整理扫描默认就只扫带内置标签的种子；即便极端情况下混入，插件复核这一关也会跳过。
+
+**Q：下载还没完成就手动整理了会怎样？**
+不会停止做种。插件会检查种子的整体下载进度，未达 100% 的种子一律跳过，避免误停卡死剩余内容的下载。等种子全部下完、再次整理时才会停做种。
 
 **Q：如何恢复做种？**
 到下载器（qBittorrent / Transmission）里对相应任务点「继续」即可。
