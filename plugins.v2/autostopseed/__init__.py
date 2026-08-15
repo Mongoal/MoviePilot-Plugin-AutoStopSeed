@@ -38,7 +38,7 @@ class AutoStopSeed(_PluginBase):
         "或整理完成时停止做种。仅作用于 MoviePilot 创建的种子。"
     )
     plugin_icon = "pause.svg"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_author = "AutoStopSeed"
     plugin_label = "下载管理"
     plugin_config_prefix = "autostopseed_"
@@ -254,7 +254,7 @@ class AutoStopSeed(_PluginBase):
             )
             return
 
-        # update_torrent 返回各项修改结果字典；seeding_time_limit 不被支持时该键为 False
+        # update_torrent 返回各项修改结果字典；qb/transmission 的做种限制结果在 "limits" 键
         if self._is_seeding_limit_set(result):
             logger.info(
                 f"已设置做种 {self._seeding_time} 分钟后停止: "
@@ -276,16 +276,22 @@ class AutoStopSeed(_PluginBase):
     def _is_seeding_limit_set(result: Any) -> bool:
         """判断 update_torrent 的返回是否成功设置了做种时间限制。
 
-        qBittorrent / Transmission 返回形如 ``{"seeding_limits": True, ...}`` 的字典；
-        rTorrent 对不支持项返回 ``{"seeding_limits": False}``；异常或 None 视为失败。
+        仅传 ``seeding_time_limit`` 时，各下载器模块（``app/modules/*/__init__.py``
+        的 ``update_torrent``）的返回结构各不相同：
+
+        - qBittorrent / Transmission：``{"limits": True/False}``，对应底层
+          ``change_torrent`` 是否成功（限速与做种限制共用该键）；
+        - rTorrent：``{"seeding_limits": False}``，封装不支持做种时间限制，固定 False；
+        - None（下载器实例不存在等）或其他结构：视为失败。
 
         :param result: update_torrent 返回值
         :return: True 表示设置成功
         """
         if not isinstance(result, dict):
             return False
-        # 链方法对各下载器的结果键名一致为 seeding_limits（见各模块 update_torrent）
-        return bool(result.get("seeding_limits"))
+        # qb/transmission 将做种限制结果写入 "limits" 键；rTorrent 不支持时返回
+        # {"seeding_limits": False}，没有 "limits" 键，同样判为失败
+        return bool(result.get("limits"))
 
     # ===== 模式 A：整理完成时停止做种 =====
     @eventmanager.register(EventType.TransferComplete)

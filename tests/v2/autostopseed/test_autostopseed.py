@@ -206,7 +206,7 @@ def test_get_page_shows_current_mode():
 def test_download_mode_sets_seeding_time_limit():
     """模式 B：DownloadAdded 应调用 update_torrent(seeding_time_limit=N)。"""
     plugin = _make_plugin(mode=MODE_ON_DOWNLOAD, seeding_time=3)
-    plugin.chain.update_torrent.return_value = {"seeding_limits": True}
+    plugin.chain.update_torrent.return_value = {"limits": True}
 
     plugin.on_download_added(_make_event(hash_value="abc", downloader="qBittorrent"))
 
@@ -218,7 +218,7 @@ def test_download_mode_sets_seeding_time_limit():
 def test_download_mode_default_seeding_time_is_one():
     """默认做种时长 1 分钟应正确传递。"""
     plugin = _make_plugin(mode=MODE_ON_DOWNLOAD)
-    plugin.chain.update_torrent.return_value = {"seeding_limits": True}
+    plugin.chain.update_torrent.return_value = {"limits": True}
 
     plugin.on_download_added(_make_event(hash_value="abc", downloader="qBittorrent"))
 
@@ -230,7 +230,7 @@ def test_download_mode_default_seeding_time_is_one():
 def test_download_mode_zero_seeding_time():
     """做种时长 0（下载完即停）应能正确传递。"""
     plugin = _make_plugin(mode=MODE_ON_DOWNLOAD, seeding_time=0)
-    plugin.chain.update_torrent.return_value = {"seeding_limits": True}
+    plugin.chain.update_torrent.return_value = {"limits": True}
 
     plugin.on_download_added(_make_event(hash_value="abc", downloader="qBittorrent"))
 
@@ -263,7 +263,7 @@ def test_download_mode_no_hash_does_nothing():
 def test_download_mode_notify_sent_when_success():
     """设置成功且开启通知时应发消息。"""
     plugin = _make_plugin(mode=MODE_ON_DOWNLOAD, notify=True)
-    plugin.chain.update_torrent.return_value = {"seeding_limits": True}
+    plugin.chain.update_torrent.return_value = {"limits": True}
 
     plugin.on_download_added(_make_event(hash_value="abc", downloader="qBittorrent"))
 
@@ -272,10 +272,31 @@ def test_download_mode_notify_sent_when_success():
     assert "已设置做种限制" in kwargs.get("title", "")
 
 
+def test_download_mode_qb_real_shape_regression():
+    """回归（v1.1.1 修复）：qb 真实返回 {"limits": True} 必须判定成功并通知。
+
+    v1.1.0 误查 rTorrent 专属的 seeding_limits 键，导致 qb 设置成功后
+    仍打「设置做种时间限制失败」警告且漏发成功通知（实测日志 result={'limits': True}）。
+    """
+    plugin = _make_plugin(mode=MODE_ON_DOWNLOAD, notify=True)
+    plugin.chain.update_torrent.return_value = {"limits": True}
+
+    plugin.on_download_added(
+        _make_event(hash_value="d25f7e34", downloader="qbittorrent")
+    )
+
+    plugin.chain.update_torrent.assert_called_once_with(
+        hash_string="d25f7e34", downloader="qbittorrent", seeding_time_limit=1
+    )
+    plugin.chain.post_message.assert_called_once()
+    _, kwargs = plugin.chain.post_message.call_args
+    assert "已设置做种限制" in kwargs.get("title", "")
+
+
 def test_download_mode_no_notify_when_disabled():
     """notify=False 时即使设置成功也不发通知。"""
     plugin = _make_plugin(mode=MODE_ON_DOWNLOAD, notify=False)
-    plugin.chain.update_torrent.return_value = {"seeding_limits": True}
+    plugin.chain.update_torrent.return_value = {"limits": True}
 
     plugin.on_download_added(_make_event(hash_value="abc", downloader="qBittorrent"))
 
@@ -319,18 +340,28 @@ def test_download_mode_exception_swallowed():
 
 # ---------- _is_seeding_limit_set 纯函数 ----------
 
-def test_is_seeding_limit_set_true_for_dict_true():
-    """返回字典含 seeding_limits=True 判定为成功。"""
-    assert AutoStopSeed._is_seeding_limit_set({"seeding_limits": True}) is True
+def test_is_seeding_limit_set_true_for_qb_shape():
+    """qb/transmission 真实形状 {"limits": True} 判定为成功。"""
+    assert AutoStopSeed._is_seeding_limit_set({"limits": True}) is True
 
 
-def test_is_seeding_limit_set_false_for_dict_false():
-    """返回字典含 seeding_limits=False（rTorrent 不支持）判定为失败。"""
+def test_is_seeding_limit_set_false_for_limits_false():
+    """qb/transmission 设置失败（底层 change_torrent 返回 False）判定为失败。"""
+    assert AutoStopSeed._is_seeding_limit_set({"limits": False}) is False
+
+
+def test_is_seeding_limit_set_false_for_rtorrent_shape():
+    """rTorrent 形状 {"seeding_limits": False}（封装不支持）判定为失败。"""
     assert AutoStopSeed._is_seeding_limit_set({"seeding_limits": False}) is False
 
 
+def test_is_seeding_limit_set_true_ignores_other_keys():
+    """仅关心做种限制项：其他项（如 save_path）失败不影响判定。"""
+    assert AutoStopSeed._is_seeding_limit_set({"limits": True, "save_path": False}) is True
+
+
 def test_is_seeding_limit_set_false_for_none():
-    """返回 None 判定为失败。"""
+    """返回 None（下载器实例不存在等）判定为失败。"""
     assert AutoStopSeed._is_seeding_limit_set(None) is False
 
 
@@ -340,7 +371,7 @@ def test_is_seeding_limit_set_false_for_non_dict():
 
 
 def test_is_seeding_limit_set_false_for_missing_key():
-    """返回字典但无 seeding_limits 键判定为失败。"""
+    """返回字典但无 limits 键（rTorrent 等）判定为失败。"""
     assert AutoStopSeed._is_seeding_limit_set({"other": True}) is False
 
 
@@ -502,5 +533,5 @@ def test_get_api_returns_empty_list():
 def test_plugin_metadata_present():
     """插件元信息属性应已定义且与 package.v2.json 一致。"""
     assert AutoStopSeed.plugin_name == "自动停止做种"
-    assert AutoStopSeed.plugin_version == "1.1.0"
+    assert AutoStopSeed.plugin_version == "1.1.1"
     assert AutoStopSeed.plugin_config_prefix == "autostopseed_"
